@@ -32,12 +32,43 @@ TOKEN_EXP   = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 1440))
 pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
 bearer_scheme = HTTPBearer(auto_error=False)
 
+# ── INIT DB ──────────────────────────────────────────────────────────────────
+def init_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    nama VARCHAR(100) NOT NULL,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    password VARCHAR(255) NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS penjualan (
+                    id SERIAL PRIMARY KEY,
+                    tanggal DATE NOT NULL,
+                    hari VARCHAR(20) NOT NULL,
+                    nama_produk VARCHAR(100) NOT NULL,
+                    stok INTEGER NOT NULL,
+                    terjual INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
 # ── APP ──────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Analisis Penjualan Getuk API")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
+
+init_db()
 
 # ── DB HELPERS ───────────────────────────────────────────────────────────────
 def db_conn():
