@@ -376,6 +376,86 @@ def build_forecast(clustered_data: list, tx_rows: list) -> list:
         })
     return forecasts
 
+def build_forecast_for_period(clustered_data: list, tx_rows: list, start_date: datetime, end_date: datetime) -> list:
+    """Buat forecast dari clusteredData untuk rentang tanggal tertentu."""
+    if not clustered_data: return []
+    
+    all_counts = {"Rendah":0,"Sedang":0,"Tinggi":0}
+    for d in clustered_data:
+        if d["cluster"] in all_counts: all_counts[d["cluster"]] += 1
+    overall = max(all_counts, key=all_counts.get)
+
+    days_diff = (end_date - start_date).days + 1
+    forecasts = []
+    for i in range(days_diff):
+        nd = start_date + timedelta(days=i)
+        wd = nd.weekday()
+        hari_map = {0:"Senin",1:"Selasa",2:"Rabu",3:"Kamis",4:"Jumat",5:"Sabtu",6:"Minggu"}
+        hari = hari_map[wd]
+
+        day_rows = [d for d in clustered_data if d["hari"]==hari]
+        counts = {"Rendah":0,"Sedang":0,"Tinggi":0}
+        for d in day_rows:
+            if d["cluster"] in counts: counts[d["cluster"]] += 1
+
+        sample = len(day_rows) or len(clustered_data)
+        dom_cat = max(counts, key=counts.get) if day_rows else overall
+        dom_rows = [d for d in day_rows if d["cluster"]==dom_cat] if day_rows else \
+                   [d for d in clustered_data if d["cluster"]==overall]
+        dom_count = counts.get(dom_cat, 0) if day_rows else len(dom_rows)
+        dom_ratio = dom_count / sample if sample else 0
+
+        avg_sold = sum(d["Total_Terjual"] for d in dom_rows)/len(dom_rows) if dom_rows else 0
+        avg_stok = sum(d["Total_Stok"]    for d in dom_rows)/len(dom_rows) if dom_rows else 0
+        min_sold = min((d["Total_Terjual"] for d in dom_rows), default=0)
+        max_sold = max((d["Total_Terjual"] for d in dom_rows), default=0)
+        min_stok = min((d["Total_Stok"]    for d in dom_rows), default=0)
+        max_stok = max((d["Total_Stok"]    for d in dom_rows), default=0)
+
+        conf = "Tinggi" if sample>=8 and dom_ratio>=0.6 else "Sedang" if sample>=4 and dom_ratio>=0.45 else "Rendah"
+        basis = (f"Berdasarkan {sample} data historis hari {hari}, kategori dominan {dom_cat} "
+                 f"muncul {dom_count} kali ({dom_ratio*100:.1f}% dari riwayat hari yang sama)."
+                 if day_rows else "Menggunakan rata-rata keseluruhan data historis.")
+
+        # Product recommendations
+        sup = [t for t in tx_rows if t["hari"]==hari and t.get("cluster")==dom_cat]
+        if not sup: sup = [t for t in tx_rows if t["hari"]==hari]
+        if not sup: sup = tx_rows
+        prod_map = {}
+        for t in sup:
+            k = t["nama"]
+            if k not in prod_map: prod_map[k] = {"nama":k,"kategoriProduk":t["kategoriProduk"],"totalTerjual":0,"totalStok":0,"count":0,"days":set()}
+            prod_map[k]["totalTerjual"] += t["terjual"]; prod_map[k]["totalStok"] += t["stok"]
+            prod_map[k]["count"] += 1; prod_map[k]["days"].add(t["tanggal"])
+        top_prods = sorted(prod_map.values(), key=lambda x: x["totalTerjual"], reverse=True)[:5]
+        reko = [{"kategoriProduk":p["kategoriProduk"],"nama":p["nama"],
+                 "rataRataTerjualProduk":round(p["totalTerjual"]/p["count"]) if p["count"] else 0,
+                 "rekomendasiStokProduk":round(p["totalStok"]/p["count"]) if p["count"] else 0,
+                 "jumlahHariAktif":len(p["days"])} for p in top_prods]
+        cat_dom = top_prods[0]["kategoriProduk"] if top_prods else "Lainnya"
+
+        forecasts.append({
+            "tanggal": nd.strftime("%Y-%m-%d"), "hari": hari, "kategori": dom_cat,
+            "perkiraanTerjual": round(avg_sold),
+            "rekomendasiStok": round(avg_stok),
+            "rentangPerkiraanPenjualan": f"{round(min_sold)} - {round(max_sold)}",
+            "tingkatKepercayaan": conf,
+            "dasarPerkiraan": basis,
+            "kategoriProdukDominan": cat_dom,
+            "produkUtamaPendukung": ", ".join(p["nama"] for p in top_prods[:3]) or "-",
+            "rekomendasiProduk": reko,
+            "jumlahRiwayatHariSerupa": sample,
+            "jumlahRiwayatKategoriDominan": dom_count,
+            "proporsiDominasiKategori": round(dom_ratio*100, 2),
+            "rataRataTotalTerjualHistorisHariSama": round(sum(d["Total_Terjual"] for d in day_rows)/len(day_rows)) if day_rows else round(avg_sold),
+            "rataRataTotalTerjualKategoriDominan": round(avg_sold),
+            "minimumTotalTerjualHistoris": round(min_sold), "maksimumTotalTerjualHistoris": round(max_sold),
+            "rataRataTotalStokHistorisHariSama": round(sum(d["Total_Stok"] for d in day_rows)/len(day_rows)) if day_rows else round(avg_stok),
+            "rataRataTotalStokKategoriDominan": round(avg_stok),
+            "minimumTotalStokHistoris": round(min_stok), "maksimumTotalStokHistoris": round(max_stok),
+        })
+    return forecasts
+
 # ── DYNAMIC TABLE HELPERS ────────────────────────────────────────────────────
 def sanitize_table_name(name: str) -> str:
     """Sanitize a table name to prevent SQL injection."""
@@ -504,6 +584,34 @@ def forecast(u=Depends(get_current_user)):
     cluster_lookup = {f"{d['tanggal']}_{d['hari']}": d["cluster"] for d in result["clusteredData"]}
     tx_enriched = [{**t, "cluster": cluster_lookup.get(f"{t['tanggal']}_{t['hari']}")} for t in data["transactionRows"]]
     forecasts = build_forecast(result["clusteredData"], tx_enriched)
+    return {"forecasts": forecasts, "total": len(forecasts)}
+
+@app.get("/api/forecast/period")
+def forecast_period(start_date: str = Query(...), end_date: str = Query(...), u=Depends(get_current_user)):
+    """Buat forecast untuk periode tanggal kustom menggunakan data penjualan utama."""
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Format tanggal harus YYYY-MM-DD")
+    
+    if start_dt > end_dt:
+        raise HTTPException(400, "Tanggal mulai tidak boleh setelah tanggal akhir")
+    
+    days_diff = (end_dt - start_dt).days + 1
+    if days_diff > 31:
+        raise HTTPException(400, "Maksimum durasi prediksi adalah 31 hari")
+        
+    data = build_full_data()
+    if not data: raise HTTPException(404, "Tidak ada data penjualan")
+    
+    result = run_kmeans_analysis(data["dailyAggregated"])
+    if not result: raise HTTPException(500, "Analisis gagal")
+    
+    cluster_lookup = {f"{d['tanggal']}_{d['hari']}": d["cluster"] for d in result["clusteredData"]}
+    tx_enriched = [{**t, "cluster": cluster_lookup.get(f"{t['tanggal']}_{t['hari']}")} for t in data["transactionRows"]]
+    
+    forecasts = build_forecast_for_period(result["clusteredData"], tx_enriched, start_dt, end_dt)
     return {"forecasts": forecasts, "total": len(forecasts)}
 
 # ── UPLOAD ENDPOINT ──────────────────────────────────────────────────────────
@@ -735,6 +843,44 @@ def analyze_dataset(dataset_id: int = Path(...), u=Depends(get_current_user)):
         "preprocessSummary": data["preprocessSummary"],
         "forecasts": forecasts,
     }
+
+@app.get("/api/datasets/{dataset_id}/forecast/period")
+def dataset_forecast_period(dataset_id: int = Path(...), start_date: str = Query(...), end_date: str = Query(...), u=Depends(get_current_user)):
+    """Buat forecast untuk periode kustom berdasarkan data dari dataset spesifik."""
+    ds = db_fetchone(
+        "SELECT * FROM datasets WHERE id=%s AND user_id=%s",
+        (dataset_id, u["id"])
+    )
+    if not ds:
+        raise HTTPException(404, "Dataset tidak ditemukan")
+    
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "Format tanggal harus YYYY-MM-DD")
+    
+    if start_dt > end_dt:
+        raise HTTPException(400, "Tanggal mulai tidak boleh setelah tanggal akhir")
+    
+    days_diff = (end_dt - start_dt).days + 1
+    if days_diff > 31:
+        raise HTTPException(400, "Maksimum durasi prediksi adalah 31 hari")
+        
+    safe_table = sanitize_table_name(ds["table_name"])
+    data = build_full_data(safe_table)
+    if not data:
+        raise HTTPException(404, "Dataset kosong")
+        
+    result = run_kmeans_analysis(data["dailyAggregated"])
+    if not result:
+        raise HTTPException(500, "Analisis gagal")
+        
+    cluster_lookup = {f"{d['tanggal']}_{d['hari']}": d["cluster"] for d in result["clusteredData"]}
+    tx_enriched = [{**t, "cluster": cluster_lookup.get(f"{t['tanggal']}_{t['hari']}")} for t in data["transactionRows"]]
+    
+    forecasts = build_forecast_for_period(result["clusteredData"], tx_enriched, start_dt, end_dt)
+    return {"forecasts": forecasts, "total": len(forecasts)}
 
 # ── EXPORT HELPERS ───────────────────────────────────────────────────────────
 def make_excel_response(df_dict: dict, filename: str) -> StreamingResponse:
