@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -13,7 +13,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-import os, io, csv, math
+import os, io, csv, math, json, re
 
 load_dotenv()
 
@@ -57,6 +57,33 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # ── NEW: datasets table to track each uploaded file ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS datasets (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    table_name VARCHAR(150) UNIQUE NOT NULL,
+                    original_filename VARCHAR(255) NOT NULL,
+                    row_count INTEGER DEFAULT 0,
+                    error_count INTEGER DEFAULT 0,
+                    columns_info TEXT DEFAULT '',
+                    date_range_start DATE,
+                    date_range_end DATE,
+                    unique_products INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            # ── NEW: user activity log ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_activity_log (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                    activity_type VARCHAR(50) NOT NULL,
+                    description TEXT,
+                    metadata JSONB DEFAULT '{}',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
         conn.commit()
     finally:
         conn.close()
@@ -95,6 +122,17 @@ def db_execute(q, p=None):
         conn.commit()
     finally: conn.close()
 
+def db_execute_returning(q, p=None):
+    """Execute a query and return the first row (useful for INSERT ... RETURNING)."""
+    conn = db_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(q, p)
+            result = cur.fetchone()
+        conn.commit()
+        return result
+    finally: conn.close()
+
 def db_executemany(q, rows):
     conn = db_conn()
     try:
@@ -102,6 +140,15 @@ def db_executemany(q, rows):
             psycopg2.extras.execute_batch(cur, q, rows, page_size=500)
         conn.commit()
     finally: conn.close()
+
+# ── ACTIVITY LOG HELPER ─────────────────────────────────────────────────────
+def log_activity(user_id: int, activity_type: str, description: str, metadata: dict = None):
+    """Log a user activity to the database."""
+    meta_json = json.dumps(metadata or {})
+    db_execute(
+        "INSERT INTO user_activity_log (user_id, activity_type, description, metadata) VALUES (%s, %s, %s, %s::jsonb)",
+        (user_id, activity_type, description, meta_json)
+    )
 
 # ── AUTH HELPERS ─────────────────────────────────────────────────────────────
 def hash_password(pw): return pwd_context.hash(pw)
@@ -160,8 +207,9 @@ DAYS_MAP = {"senin":"Senin","selasa":"Selasa","rabu":"Rabu","kamis":"Kamis",
 def normalize_day(raw: str) -> str:
     return DAYS_MAP.get(raw.strip().lower(), raw.strip().title())
 
-def build_full_data():
-    rows = db_fetchall("SELECT tanggal,hari,nama_produk,stok,terjual FROM penjualan ORDER BY tanggal")
+def build_full_data(source_table: str = "penjualan"):
+    """Build full data from a given table (default: penjualan)."""
+    rows = db_fetchall(f"SELECT tanggal,hari,nama_produk,stok,terjual FROM {source_table} ORDER BY tanggal")
     if not rows: return None
     tx, daily_map = [], {}
     for r in rows:
@@ -200,7 +248,7 @@ def run_kmeans_analysis(daily: list):
     elbow = []
     for k in range(1, min(11, len(df)+1)):
         km = KMeans(n_clusters=k, random_state=42, n_init=10)
-        km.fit(X); elbow.append(float(km.inertia_))
+        km.fit(X); elbow.append({"k": k, "inertia": float(km.inertia_)})
 
     # Final k=3
     k_final = min(3, len(df))
@@ -252,8 +300,6 @@ def build_forecast(clustered_data: list, tx_rows: list) -> list:
             except ValueError:
                 # Fallback ke hari ini
                 last_date = datetime.now()
-    
-    days_rev = {0:"Minggu",1:"Senin",2:"Selasa",3:"Rabu",4:"Kamis",5:"Jumat",6:"Sabtu"}
 
     all_counts = {"Rendah":0,"Sedang":0,"Tinggi":0}
     for d in clustered_data:
@@ -263,8 +309,6 @@ def build_forecast(clustered_data: list, tx_rows: list) -> list:
     forecasts = []
     for i in range(1, 8):
         nd = last_date + timedelta(days=i)
-        hari = days_rev[nd.weekday() % 7 if nd.weekday() < 6 else 0]
-        # fix: Python weekday 0=Mon..6=Sun
         wd = nd.weekday()
         hari_map = {0:"Senin",1:"Selasa",2:"Rabu",3:"Kamis",4:"Jumat",5:"Sabtu",6:"Minggu"}
         hari = hari_map[wd]
@@ -312,22 +356,59 @@ def build_forecast(clustered_data: list, tx_rows: list) -> list:
 
         forecasts.append({
             "tanggal": nd.strftime("%Y-%m-%d"), "hari": hari, "kategori": dom_cat,
-            "jumlahRiwayatHariSerupa": sample, "jumlahRiwayatKategoriDominan": dom_count,
+            "perkiraanTerjual": round(avg_sold),
+            "rekomendasiStok": round(avg_stok),
+            "rentangPerkiraanPenjualan": f"{round(min_sold)} - {round(max_sold)}",
+            "tingkatKepercayaan": conf,
+            "dasarPerkiraan": basis,
+            "kategoriProdukDominan": cat_dom,
+            "produkUtamaPendukung": ", ".join(p["nama"] for p in top_prods[:3]) or "-",
+            "rekomendasiProduk": reko,
+            "jumlahRiwayatHariSerupa": sample,
+            "jumlahRiwayatKategoriDominan": dom_count,
             "proporsiDominasiKategori": round(dom_ratio*100, 2),
             "rataRataTotalTerjualHistorisHariSama": round(sum(d["Total_Terjual"] for d in day_rows)/len(day_rows)) if day_rows else round(avg_sold),
             "rataRataTotalTerjualKategoriDominan": round(avg_sold),
             "minimumTotalTerjualHistoris": round(min_sold), "maksimumTotalTerjualHistoris": round(max_sold),
-            "perkiraanTerjual": round(avg_sold),
-            "rentangPerkiraanPenjualan": f"{round(min_sold)} - {round(max_sold)}",
             "rataRataTotalStokHistorisHariSama": round(sum(d["Total_Stok"] for d in day_rows)/len(day_rows)) if day_rows else round(avg_stok),
             "rataRataTotalStokKategoriDominan": round(avg_stok),
             "minimumTotalStokHistoris": round(min_stok), "maksimumTotalStokHistoris": round(max_stok),
-            "kategoriProdukDominan": cat_dom,
-            "produkUtamaPendukung": ", ".join(p["nama"] for p in top_prods[:3]) or "-",
-            "rekomendasiProduk": reko, "rekomendasiStok": round(avg_stok),
-            "tingkatKepercayaan": conf, "dasarPerkiraan": basis,
         })
     return forecasts
+
+# ── DYNAMIC TABLE HELPERS ────────────────────────────────────────────────────
+def sanitize_table_name(name: str) -> str:
+    """Sanitize a table name to prevent SQL injection."""
+    return re.sub(r'[^a-zA-Z0-9_]', '', name)
+
+def create_dataset_table(table_name: str):
+    """Create a new table for a specific dataset upload."""
+    safe_name = sanitize_table_name(table_name)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {safe_name} (
+                    id SERIAL PRIMARY KEY,
+                    tanggal DATE NOT NULL,
+                    hari VARCHAR(20) NOT NULL,
+                    nama_produk VARCHAR(100) NOT NULL,
+                    stok INTEGER NOT NULL,
+                    terjual INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+def insert_into_dataset_table(table_name: str, rows: list):
+    """Insert rows into a dataset-specific table."""
+    safe_name = sanitize_table_name(table_name)
+    db_executemany(
+        f"INSERT INTO {safe_name} (tanggal,hari,nama_produk,stok,terjual) VALUES (%s,%s,%s,%s,%s)",
+        rows
+    )
 
 # ── AUTH ENDPOINTS ───────────────────────────────────────────────────────────
 @app.get("/")
@@ -338,6 +419,8 @@ def login(body: LoginRequest):
     user = db_fetchone("SELECT id,nama,username,password FROM users WHERE username=%s", (body.username,))
     if not user or not verify_password(body.password, user["password"]):
         raise HTTPException(401, "Username atau password salah")
+    # Log login activity
+    log_activity(user["id"], "login", f"User {user['username']} berhasil login")
     return {"access_token": create_token({"sub": user["username"]}), "token_type": "bearer",
             "user": {"id": user["id"], "nama": user["nama"], "username": user["username"]}}
 
@@ -426,9 +509,10 @@ def forecast(u=Depends(get_current_user)):
 # ── UPLOAD ENDPOINT ──────────────────────────────────────────────────────────
 @app.post("/api/penjualan/upload")
 async def upload_penjualan(file: UploadFile = File(...), u=Depends(get_current_user)):
-    """Upload file CSV/Excel, parse, simpan ke DB, kembalikan full-data baru."""
+    """Upload file CSV/Excel, parse, simpan ke DB (tabel penjualan + tabel baru per upload)."""
     content = await file.read()
     fname = file.filename.lower()
+    original_filename = file.filename
     rows_parsed = []
     errors = 0
 
@@ -469,14 +553,50 @@ async def upload_penjualan(file: UploadFile = File(...), u=Depends(get_current_u
     if not rows_parsed:
         raise HTTPException(400, "Tidak ada baris valid dalam file. Pastikan kolom: Tanggal, Hari, Nama Produk, Stok, Terjual.")
 
+    # ── 1. Insert ke tabel penjualan utama (backward compatible) ──
     db_executemany(
         "INSERT INTO penjualan (tanggal,hari,nama_produk,stok,terjual) VALUES (%s,%s,%s,%s,%s)",
         rows_parsed
     )
+
+    # ── 2. Create new dynamic table for this upload ──
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    table_name = f"dataset_{u['id']}_{timestamp_str}"
+    safe_table = sanitize_table_name(table_name)
+    
+    create_dataset_table(safe_table)
+    insert_into_dataset_table(safe_table, rows_parsed)
+
+    # ── 3. Compute metadata for the dataset ──
+    dates_parsed = [r[0] for r in rows_parsed]
+    products = set(r[2] for r in rows_parsed)
+    
+    # Register dataset
+    dataset_record = db_execute_returning(
+        """INSERT INTO datasets (user_id, table_name, original_filename, row_count, error_count, 
+           columns_info, date_range_start, date_range_end, unique_products)
+           VALUES (%s, %s, %s, %s, %s, %s, %s::date, %s::date, %s) RETURNING id""",
+        (u["id"], safe_table, original_filename, len(rows_parsed), errors,
+         "Tanggal, Hari, Nama Produk, Stok, Terjual",
+         min(dates_parsed), max(dates_parsed), len(products))
+    )
+    dataset_id = dataset_record["id"] if dataset_record else None
+
+    # ── 4. Log activity ──
+    log_activity(u["id"], "upload", f"Upload file: {original_filename}", {
+        "filename": original_filename,
+        "dataset_id": dataset_id,
+        "table_name": safe_table,
+        "row_count": len(rows_parsed),
+        "error_count": errors,
+        "unique_products": len(products),
+    })
+
     data = build_full_data()
     return {
         "message": f"Berhasil import {len(rows_parsed)} baris, {errors} baris dilewati.",
         "imported": len(rows_parsed), "errors": errors,
+        "dataset_id": dataset_id,
         **data
     }
 
@@ -484,7 +604,137 @@ async def upload_penjualan(file: UploadFile = File(...), u=Depends(get_current_u
 def clear_penjualan(u=Depends(get_current_user)):
     """Hapus semua data penjualan (untuk re-upload bersih)."""
     db_execute("DELETE FROM penjualan")
+    log_activity(u["id"], "clear_data", "Menghapus semua data penjualan")
     return {"message": "Semua data penjualan berhasil dihapus"}
+
+# ── ACTIVITY LOG ENDPOINTS ───────────────────────────────────────────────────
+@app.get("/api/activity-log")
+def get_activity_log(limit: int = 50, u=Depends(get_current_user)):
+    """Ambil riwayat aktivitas user yang sedang login."""
+    rows = db_fetchall(
+        """SELECT al.id, al.activity_type, al.description, al.metadata, 
+                  al.created_at, u.nama AS user_nama, u.username AS user_username
+           FROM user_activity_log al
+           JOIN users u ON al.user_id = u.id
+           WHERE al.user_id = %s
+           ORDER BY al.created_at DESC
+           LIMIT %s""",
+        (u["id"], limit)
+    )
+    result = []
+    for r in rows:
+        item = dict(r)
+        # Format created_at for frontend
+        if hasattr(item["created_at"], "isoformat"):
+            item["created_at"] = item["created_at"].isoformat()
+        # Ensure metadata is dict
+        if isinstance(item["metadata"], str):
+            try:
+                item["metadata"] = json.loads(item["metadata"])
+            except:
+                item["metadata"] = {}
+        result.append(item)
+    return {"activities": result, "total": len(result)}
+
+# ── DATASET ENDPOINTS ────────────────────────────────────────────────────────
+@app.get("/api/datasets")
+def get_datasets(u=Depends(get_current_user)):
+    """Ambil daftar semua dataset yang pernah di-upload user."""
+    rows = db_fetchall(
+        """SELECT id, table_name, original_filename, row_count, error_count,
+                  columns_info, date_range_start, date_range_end, unique_products, created_at
+           FROM datasets
+           WHERE user_id = %s
+           ORDER BY created_at DESC""",
+        (u["id"],)
+    )
+    result = []
+    for r in rows:
+        item = dict(r)
+        if hasattr(item.get("created_at"), "isoformat"):
+            item["created_at"] = item["created_at"].isoformat()
+        if hasattr(item.get("date_range_start"), "isoformat"):
+            item["date_range_start"] = item["date_range_start"].isoformat() if item["date_range_start"] else None
+        if hasattr(item.get("date_range_end"), "isoformat"):
+            item["date_range_end"] = item["date_range_end"].isoformat() if item["date_range_end"] else None
+        result.append(item)
+    return {"datasets": result, "total": len(result)}
+
+@app.get("/api/datasets/{dataset_id}")
+def get_dataset_detail(dataset_id: int = Path(...), u=Depends(get_current_user)):
+    """Ambil detail sebuah dataset beserta datanya."""
+    ds = db_fetchone(
+        "SELECT * FROM datasets WHERE id=%s AND user_id=%s",
+        (dataset_id, u["id"])
+    )
+    if not ds:
+        raise HTTPException(404, "Dataset tidak ditemukan")
+    
+    ds = dict(ds)
+    safe_table = sanitize_table_name(ds["table_name"])
+    
+    # Check if table exists
+    exists = db_fetchone(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name=%s)",
+        (safe_table,)
+    )
+    if not exists or not exists.get("exists", False):
+        raise HTTPException(404, "Tabel dataset tidak ditemukan di database")
+    
+    # Build full data from the dataset-specific table
+    data = build_full_data(safe_table)
+    
+    # Format dates
+    if hasattr(ds.get("created_at"), "isoformat"):
+        ds["created_at"] = ds["created_at"].isoformat()
+    if hasattr(ds.get("date_range_start"), "isoformat"):
+        ds["date_range_start"] = ds["date_range_start"].isoformat() if ds["date_range_start"] else None
+    if hasattr(ds.get("date_range_end"), "isoformat"):
+        ds["date_range_end"] = ds["date_range_end"].isoformat() if ds["date_range_end"] else None
+    
+    return {
+        "dataset": ds,
+        **(data or {"transactionRows": [], "dailyAggregated": [], "preprocessSummary": None}),
+    }
+
+@app.get("/api/datasets/{dataset_id}/analyze")
+def analyze_dataset(dataset_id: int = Path(...), u=Depends(get_current_user)):
+    """Jalankan K-Means pada dataset spesifik."""
+    ds = db_fetchone(
+        "SELECT * FROM datasets WHERE id=%s AND user_id=%s",
+        (dataset_id, u["id"])
+    )
+    if not ds:
+        raise HTTPException(404, "Dataset tidak ditemukan")
+    
+    safe_table = sanitize_table_name(ds["table_name"])
+    data = build_full_data(safe_table)
+    if not data:
+        raise HTTPException(404, "Dataset kosong")
+    
+    result = run_kmeans_analysis(data["dailyAggregated"])
+    if not result:
+        raise HTTPException(500, "Analisis gagal")
+    
+    # Enrich tx rows
+    cluster_lookup = {f"{d['tanggal']}_{d['hari']}": d["cluster"] for d in result["clusteredData"]}
+    tx_enriched = [{**t, "cluster": cluster_lookup.get(f"{t['tanggal']}_{t['hari']}")} for t in data["transactionRows"]]
+    
+    # Build forecast
+    forecasts = build_forecast(result["clusteredData"], tx_enriched)
+    
+    # Log analyze activity
+    log_activity(u["id"], "analyze", f"Analisis dataset: {ds['original_filename']}", {
+        "dataset_id": dataset_id,
+        "filename": ds["original_filename"],
+    })
+    
+    return {
+        **result,
+        "transactionRows": tx_enriched,
+        "preprocessSummary": data["preprocessSummary"],
+        "forecasts": forecasts,
+    }
 
 # ── EXPORT HELPERS ───────────────────────────────────────────────────────────
 def make_excel_response(df_dict: dict, filename: str) -> StreamingResponse:
@@ -525,6 +775,7 @@ def export_history(u=Depends(get_current_user)):
     produk = [{"Tanggal":r["tanggal"],"Hari":r["hari"],"Nama Produk":r["nama_produk"],
                "Stok":r["stok"],"Terjual":r["terjual"]} for r in rows]
     harian = [dict(r) for r in daily]
+    log_activity(u["id"], "export", "Export history ke Excel")
     return make_excel_response({"Data Harian": harian, "Data Per Produk": produk},
                                f"history_penjualan_{datetime.now().strftime('%Y%m%d')}.xlsx")
 
@@ -543,6 +794,7 @@ def export_report(u=Depends(get_current_user)):
               "Rata-rata Terjual":round(s["avgTerjual"]),"Rata-rata Stok":round(s["avgStok"]),
               "Min Terjual":s["minTerjual"],"Max Terjual":s["maxTerjual"],"Hari Dominan":s["dominantDay"]}
              for s in result["stats"]]
+    log_activity(u["id"], "export", "Export report K-Means ke Excel")
     return make_excel_response({"Ringkasan Cluster": stats, "Data Klaster Harian": clustered},
                                f"report_kmeans_{datetime.now().strftime('%Y%m%d')}.xlsx")
 
@@ -571,6 +823,7 @@ def export_forecast(u=Depends(get_current_user)):
                                  "Rata-rata Terjual":p["rataRataTerjualProduk"],
                                  "Rekomendasi Stok":p["rekomendasiStokProduk"],
                                  "Hari Aktif":p["jumlahHariAktif"]})
+    log_activity(u["id"], "export", "Export forecast ke Excel")
     return make_excel_response({"Forecast 7 Hari": main_rows, "Detail Produk": detail_rows},
                                f"forecast_{datetime.now().strftime('%Y%m%d')}.xlsx")
 
