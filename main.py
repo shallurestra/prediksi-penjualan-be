@@ -57,6 +57,10 @@ def init_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # Alter table to add user_id column if not exists
+            cur.execute("""
+                ALTER TABLE penjualan ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id) ON DELETE CASCADE;
+            """)
             # ── NEW: datasets table to track each uploaded file ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS datasets (
@@ -207,9 +211,12 @@ DAYS_MAP = {"senin":"Senin","selasa":"Selasa","rabu":"Rabu","kamis":"Kamis",
 def normalize_day(raw: str) -> str:
     return DAYS_MAP.get(raw.strip().lower(), raw.strip().title())
 
-def build_full_data(source_table: str = "penjualan"):
+def build_full_data(source_table: str = "penjualan", user_id: int = None):
     """Build full data from a given table (default: penjualan)."""
-    rows = db_fetchall(f"SELECT tanggal,hari,nama_produk,stok,terjual FROM {source_table} ORDER BY tanggal")
+    if source_table == "penjualan" and user_id is not None:
+        rows = db_fetchall("SELECT tanggal,hari,nama_produk,stok,terjual FROM penjualan WHERE user_id = %s ORDER BY tanggal", (user_id,))
+    else:
+        rows = db_fetchall(f"SELECT tanggal,hari,nama_produk,stok,terjual FROM {source_table} ORDER BY tanggal")
     if not rows: return None
     tx, daily_map = [], {}
     for r in rows:
@@ -521,7 +528,7 @@ def get_me(u=Depends(get_current_user)): return u
 # ── DATA ENDPOINTS ───────────────────────────────────────────────────────────
 @app.get("/api/full-data")
 def get_full_data(u=Depends(get_current_user)):
-    data = build_full_data()
+    data = build_full_data(user_id=u["id"])
     if not data: raise HTTPException(404, "Tidak ada data penjualan di database")
     return data
 
@@ -531,7 +538,10 @@ def get_dataset_info(u=Depends(get_current_user)):
         SELECT COUNT(*) AS total_baris, COUNT(DISTINCT nama_produk) AS total_produk_unik,
                COUNT(DISTINCT tanggal) AS total_hari, MIN(tanggal)::text AS tanggal_mulai,
                MAX(tanggal)::text AS tanggal_akhir, SUM(terjual) AS total_terjual, SUM(stok) AS total_stok
-        FROM penjualan""")
+        FROM penjualan WHERE user_id = %s""", (u["id"],))
+    # If no data found, return defaults
+    if not row or row.get("total_baris") == 0:
+        return {"total_baris": 0, "total_produk_unik": 0, "total_hari": 0, "tanggal_mulai": None, "tanggal_akhir": None, "total_terjual": 0, "total_stok": 0}
     return dict(row)
 
 @app.get("/api/daily-sales")
@@ -539,7 +549,7 @@ def get_daily_sales(u=Depends(get_current_user)):
     rows = db_fetchall("""
         SELECT tanggal::text AS "Tanggal", hari AS "Hari",
                SUM(terjual) AS "Total_Terjual", SUM(stok) AS "Total_Stok"
-        FROM penjualan GROUP BY tanggal,hari ORDER BY tanggal""")
+        FROM penjualan WHERE user_id = %s GROUP BY tanggal,hari ORDER BY tanggal""", (u["id"],))
     return [dict(r) for r in rows]
 
 @app.get("/api/top-products")
@@ -547,7 +557,7 @@ def get_top_products(limit: int = 10, u=Depends(get_current_user)):
     rows = db_fetchall("""
         SELECT nama_produk AS "Nama Produk", SUM(terjual) AS "Total_Terjual",
                ROUND(AVG(terjual)::numeric,2) AS "Rata_Terjual"
-        FROM penjualan GROUP BY nama_produk ORDER BY "Total_Terjual" DESC LIMIT %s""", (limit,))
+        FROM penjualan WHERE user_id = %s GROUP BY nama_produk ORDER BY "Total_Terjual" DESC LIMIT %s""", (u["id"], limit))
     return [dict(r) for r in rows]
 
 @app.get("/api/products")
@@ -557,14 +567,14 @@ def get_products(u=Depends(get_current_user)):
                SUM(terjual) AS "Total_Terjual", ROUND(AVG(terjual)::numeric,2) AS "Rata_Terjual",
                COUNT(*) AS "Jumlah_Hari",
                ROUND(SUM(terjual)::numeric/NULLIF(SUM(stok),0),4) AS "Rasio_Terjual"
-        FROM penjualan GROUP BY nama_produk ORDER BY "Total_Terjual" DESC""")
+        FROM penjualan WHERE user_id = %s GROUP BY nama_produk ORDER BY "Total_Terjual" DESC""", (u["id"],))
     return {"total_produk": len(rows), "data": [dict(r) for r in rows]}
 
 # ── ANALYZE ENDPOINT ─────────────────────────────────────────────────────────
 @app.get("/api/analyze")
 def analyze(u=Depends(get_current_user)):
     """Jalankan K-Means sklearn server-side, kembalikan clusteredData + stats + elbowData."""
-    data = build_full_data()
+    data = build_full_data(user_id=u["id"])
     if not data: raise HTTPException(404, "Tidak ada data")
     result = run_kmeans_analysis(data["dailyAggregated"])
     if not result: raise HTTPException(500, "Analisis gagal")
@@ -577,7 +587,7 @@ def analyze(u=Depends(get_current_user)):
 @app.get("/api/forecast")
 def forecast(u=Depends(get_current_user)):
     """Buat 7-hari forecast berdasarkan K-Means clustering."""
-    data = build_full_data()
+    data = build_full_data(user_id=u["id"])
     if not data: raise HTTPException(404, "Tidak ada data")
     result = run_kmeans_analysis(data["dailyAggregated"])
     if not result: raise HTTPException(500, "Analisis gagal")
@@ -602,7 +612,7 @@ def forecast_period(start_date: str = Query(...), end_date: str = Query(...), u=
     if days_diff > 31:
         raise HTTPException(400, "Maksimum durasi prediksi adalah 31 hari")
         
-    data = build_full_data()
+    data = build_full_data(user_id=u["id"])
     if not data: raise HTTPException(404, "Tidak ada data penjualan")
     
     result = run_kmeans_analysis(data["dailyAggregated"])
@@ -661,10 +671,10 @@ async def upload_penjualan(file: UploadFile = File(...), u=Depends(get_current_u
     if not rows_parsed:
         raise HTTPException(400, "Tidak ada baris valid dalam file. Pastikan kolom: Tanggal, Hari, Nama Produk, Stok, Terjual.")
 
-    # ── 1. Insert ke tabel penjualan utama (backward compatible) ──
+    # ── 1. Insert ke tabel penjualan utama dengan user_id ──
     db_executemany(
-        "INSERT INTO penjualan (tanggal,hari,nama_produk,stok,terjual) VALUES (%s,%s,%s,%s,%s)",
-        rows_parsed
+        "INSERT INTO penjualan (tanggal,hari,nama_produk,stok,terjual,user_id) VALUES (%s,%s,%s,%s,%s,%s)",
+        [(r[0], r[1], r[2], r[3], r[4], u["id"]) for r in rows_parsed]
     )
 
     # ── 2. Create new dynamic table for this upload ──
@@ -700,7 +710,7 @@ async def upload_penjualan(file: UploadFile = File(...), u=Depends(get_current_u
         "unique_products": len(products),
     })
 
-    data = build_full_data()
+    data = build_full_data(user_id=u["id"])
     return {
         "message": f"Berhasil import {len(rows_parsed)} baris, {errors} baris dilewati.",
         "imported": len(rows_parsed), "errors": errors,
@@ -710,10 +720,10 @@ async def upload_penjualan(file: UploadFile = File(...), u=Depends(get_current_u
 
 @app.delete("/api/penjualan/clear")
 def clear_penjualan(u=Depends(get_current_user)):
-    """Hapus semua data penjualan (untuk re-upload bersih)."""
-    db_execute("DELETE FROM penjualan")
-    log_activity(u["id"], "clear_data", "Menghapus semua data penjualan")
-    return {"message": "Semua data penjualan berhasil dihapus"}
+    """Hapus data penjualan milik user saat ini."""
+    db_execute("DELETE FROM penjualan WHERE user_id = %s", (u["id"],))
+    log_activity(u["id"], "clear_data", "Menghapus data penjualan akun ini")
+    return {"message": "Semua data penjualan Anda berhasil dihapus"}
 
 # ── ACTIVITY LOG ENDPOINTS ───────────────────────────────────────────────────
 @app.get("/api/activity-log")
@@ -913,11 +923,11 @@ def make_excel_response(df_dict: dict, filename: str) -> StreamingResponse:
 @app.get("/api/export/history")
 def export_history(u=Depends(get_current_user)):
     """Export riwayat penjualan ke Excel (2 sheet: harian & per produk)."""
-    rows = db_fetchall("SELECT tanggal::text,hari,nama_produk,stok,terjual FROM penjualan ORDER BY tanggal,nama_produk")
+    rows = db_fetchall("SELECT tanggal::text,hari,nama_produk,stok,terjual FROM penjualan WHERE user_id = %s ORDER BY tanggal,nama_produk", (u["id"],))
     daily = db_fetchall("""
         SELECT tanggal::text AS "Tanggal", hari AS "Hari",
                SUM(stok) AS "Total Stok", SUM(terjual) AS "Total Terjual", COUNT(*) AS "Jumlah Produk"
-        FROM penjualan GROUP BY tanggal,hari ORDER BY tanggal""")
+        FROM penjualan WHERE user_id = %s GROUP BY tanggal,hari ORDER BY tanggal""", (u["id"],))
     produk = [{"Tanggal":r["tanggal"],"Hari":r["hari"],"Nama Produk":r["nama_produk"],
                "Stok":r["stok"],"Terjual":r["terjual"]} for r in rows]
     harian = [dict(r) for r in daily]
@@ -928,7 +938,7 @@ def export_history(u=Depends(get_current_user)):
 @app.get("/api/export/report")
 def export_report(u=Depends(get_current_user)):
     """Export laporan K-Means ke Excel."""
-    data = build_full_data()
+    data = build_full_data(user_id=u["id"])
     if not data: raise HTTPException(404, "Tidak ada data")
     result = run_kmeans_analysis(data["dailyAggregated"])
     if not result: raise HTTPException(500, "Analisis gagal")
@@ -947,7 +957,7 @@ def export_report(u=Depends(get_current_user)):
 @app.get("/api/export/forecast")
 def export_forecast(u=Depends(get_current_user)):
     """Export hasil forecast 7 hari ke Excel."""
-    data = build_full_data()
+    data = build_full_data(user_id=u["id"])
     if not data: raise HTTPException(404, "Tidak ada data")
     result = run_kmeans_analysis(data["dailyAggregated"])
     if not result: raise HTTPException(500, "Analisis gagal")
